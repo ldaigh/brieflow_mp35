@@ -402,7 +402,7 @@ def plot_cell_metric_histogram(df, sort_by="count", x_cutoff=None):
     return outliers, fig
 
 
-def plot_gene_symbol_histogram(df, x_cutoff=None):
+def plot_gene_symbol_histogram(df, x_cutoff=None, control_prefix=None):
     """Plot a histogram of the number of counts of each unique gene_symbol_0.
 
     Args:
@@ -410,11 +410,20 @@ def plot_gene_symbol_histogram(df, x_cutoff=None):
             DataFrame containing the data with a column 'gene_symbol_0'.
         x_cutoff (int, optional):
             Cutoff value for the x-axis. If None, will be calculated from data.
+        control_prefix (str, optional):
+            If provided, gene symbols starting with this prefix (e.g. "0Safe")
+            are excluded before counting.
 
     Returns:
         pandas.Series: Series containing outlier gene symbols with counts exceeding x_cutoff.
         matplotlib.figure.Figure: The figure object containing the histogram plot.
     """
+    # Optionally drop control perturbations
+    title = "Histogram of Gene Symbol Counts"
+    if control_prefix is not None:
+        df = df[~df["gene_symbol_0"].astype(str).str.startswith(control_prefix)]
+        title = f"{title} (Controls Excluded)"
+
     # Count occurrences of each unique gene_symbol_0
     gene_symbol_counts = df["gene_symbol_0"].value_counts()
 
@@ -438,7 +447,7 @@ def plot_gene_symbol_histogram(df, x_cutoff=None):
     )
 
     # Set title and axis labels
-    ax.set_title("Histogram of Gene Symbol Counts", fontsize=16, fontweight="bold")
+    ax.set_title(title, fontsize=16, fontweight="bold")
     ax.set_xlabel("Number of cells per mapped gene", fontsize=12)
     ax.set_ylabel("Number of mapped genes", fontsize=12)
 

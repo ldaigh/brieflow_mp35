@@ -1,5 +1,6 @@
 import streamlit as st
 import uuid
+import io
 
 st.set_page_config(
     page_title="Cluster Analysis - Brieflow Analysis",
@@ -9,6 +10,7 @@ st.set_page_config(
 import pandas as pd
 import glob
 import os
+import sys
 import json
 
 import plotly.graph_objects as go
@@ -20,6 +22,22 @@ from src.config import load_config
 from src.filesystem import FileSystem
 from src.filtering import create_filter_radio, apply_filter
 from src.config import BRIEFLOW_OUTPUT_PATH, STATIC_ASSET_URL_ROOT, STATIC_ASSET_PATH
+from src.rendering import render_composite_montage
+from src.scrnaseq_aging import (
+    SCRNASEQ_AGING_FEATURE,
+    attach_scrnaseq_aging,
+    has_scrnaseq_aging_data,
+)
+from src.external_deg import attach_external_deg, available_external_deg_features
+
+# Make the brieflow workflow library importable (same pattern as src/rendering.py)
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from workflow.lib.cluster.cluster_eval import (
+    get_significant_features_for_gene,
+    rank_constructs_for_gene,
+    load_control_feature_values,
+    plot_feature_vs_control,
+)
 
 # =====================
 # CONSTANTS
@@ -33,6 +51,39 @@ GENE_SYMBOL_INDEX = 0
 CLUSTER_INDEX = 1
 CELL_COUNT_INDEX = 2
 SOURCE_INDEX = 3
+
+# Parula colorscale (plotly format: [[position, "#rrggbb"], ...])
+# Standard 64-point parula approximation matching MATLAB's default colormap
+_PARULA_RGB = [
+    (0.2081, 0.1663, 0.5292), (0.2116, 0.1898, 0.5777), (0.2123, 0.2138, 0.6270),
+    (0.2081, 0.2386, 0.6771), (0.1959, 0.2645, 0.7279), (0.1707, 0.2919, 0.7792),
+    (0.1253, 0.3242, 0.8303), (0.0591, 0.3598, 0.8683), (0.0117, 0.3875, 0.8820),
+    (0.0060, 0.4087, 0.8828), (0.0165, 0.4266, 0.8786), (0.0329, 0.4430, 0.8720),
+    (0.0498, 0.4586, 0.8641), (0.0629, 0.4737, 0.8554), (0.0723, 0.4887, 0.8467),
+    (0.0779, 0.5040, 0.8384), (0.0793, 0.5200, 0.8312), (0.0749, 0.5375, 0.8262),
+    (0.0641, 0.5570, 0.8243), (0.0462, 0.5788, 0.8260), (0.0227, 0.6025, 0.8308),
+    (0.0036, 0.6270, 0.8354), (0.0000, 0.6512, 0.8351), (0.0000, 0.6739, 0.8276),
+    (0.0102, 0.6938, 0.8127), (0.0460, 0.7099, 0.7918), (0.1011, 0.7220, 0.7663),
+    (0.1605, 0.7303, 0.7390), (0.2148, 0.7357, 0.7113), (0.2650, 0.7389, 0.6842),
+    (0.3099, 0.7402, 0.6581), (0.3511, 0.7400, 0.6327), (0.3884, 0.7385, 0.6078),
+    (0.4227, 0.7359, 0.5832), (0.4543, 0.7322, 0.5590), (0.4833, 0.7275, 0.5351),
+    (0.5103, 0.7219, 0.5114), (0.5355, 0.7154, 0.4878), (0.5593, 0.7079, 0.4641),
+    (0.5817, 0.6993, 0.4404), (0.6029, 0.6896, 0.4164), (0.6231, 0.6787, 0.3920),
+    (0.6424, 0.6666, 0.3672), (0.6608, 0.6531, 0.3419), (0.6784, 0.6381, 0.3158),
+    (0.6953, 0.6215, 0.2890), (0.7116, 0.6031, 0.2611), (0.7272, 0.5827, 0.2320),
+    (0.7422, 0.5599, 0.2016), (0.7566, 0.5345, 0.1694), (0.7703, 0.5063, 0.1352),
+    (0.7832, 0.4752, 0.0988), (0.7952, 0.4409, 0.0598), (0.8060, 0.4031, 0.0183),
+    (0.8155, 0.3614, 0.0000), (0.8237, 0.3152, 0.0000), (0.8305, 0.2644, 0.0000),
+    (0.8357, 0.2084, 0.0000), (0.8392, 0.1469, 0.0000), (0.8410, 0.0797, 0.0000),
+    (0.8409, 0.0062, 0.0000), (0.8389, 0.0000, 0.0000), (0.8345, 0.0000, 0.0000),
+    (0.8275, 0.0000, 0.0126), (0.9163, 0.9831, 0.1023),
+]
+PARULA_COLORSCALE = [
+    [i / (len(_PARULA_RGB) - 1), "#{:02x}{:02x}{:02x}".format(
+        int(r * 255), int(g * 255), int(b * 255)
+    )]
+    for i, (r, g, b) in enumerate(_PARULA_RGB)
+]
 
 # =====================
 # FUNCTIONS
@@ -119,6 +170,48 @@ def load_cluster_data():
 
 
 @st.cache_data
+def load_significant_features(cell_class, channel_combo, fdr_threshold=0.05):
+    """Return sorted list of feature names where any gene passes FDR threshold."""
+    bootstrap_path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "bootstrap",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__all_gene_bootstrap_results.tsv",
+    )
+    if not os.path.exists(bootstrap_path):
+        return []
+    df = pd.read_csv(bootstrap_path, sep="\t")
+    fdr_cols = [c for c in df.columns if c.endswith("_fdr")]
+    significant = [
+        c[:-4]  # strip "_fdr" suffix to get feature name
+        for c in fdr_cols
+        if (df[c] < fdr_threshold).any()
+    ]
+    return sorted(significant)
+
+
+@st.cache_data
+def load_feature_data(cell_class, channel_combo):
+    """Return gene-level feature DataFrame indexed by gene_symbol_0.
+
+    External scRNA-seq aging values are appended as an extra column so they can
+    be selected in the same "color by feature" dropdown as CellProfiler features.
+    """
+    feature_path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "tsvs",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__features_genes.tsv",
+    )
+    if not os.path.exists(feature_path):
+        return pd.DataFrame()
+    df = pd.read_csv(feature_path, sep="\t")
+    df.set_index("gene_symbol_0", inplace=True)
+    df = attach_scrnaseq_aging(df, add_fdr=False)
+    return attach_external_deg(df, add_fdr=False)
+
+
+@st.cache_data
 def load_montage_data(root_dir, gene_name):
     # Find all montage files
     files = FileSystem.find_files(
@@ -169,7 +262,13 @@ def make_scatter_trace(x, y, marker, text, customdata, name, showlegend, color=N
     # Optionally override color in marker
     if color is not None:
         marker = dict(marker, color=color)
-    return go.Scattergl(
+    # Scattergl (WebGL) is fast but rasterizes points on SVG export. When the
+    # user enables vector export, render with go.Scatter (SVG) so each point
+    # becomes an individually selectable vector shape in the exported SVG.
+    trace_cls = (
+        go.Scatter if st.session_state.get("cluster_vector_export", False) else go.Scattergl
+    )
+    return trace_cls(
         x=x,
         y=y,
         mode="markers",
@@ -183,7 +282,7 @@ def make_scatter_trace(x, y, marker, text, customdata, name, showlegend, color=N
 
 
 # -- Display helpers --
-def display_gene_montages(gene_montages_root, gene):
+def display_gene_montages(gene_montages_root, gene, composite_container=None):
     gene_dir = os.path.join(gene_montages_root, gene)
     if not os.path.exists(gene_dir):
         st.warning(f"No montage directory found for gene {gene}")
@@ -252,6 +351,11 @@ def display_gene_montages(gene_montages_root, gene):
                 )
 
                 if os.path.exists(overlay_tiff_path):
+                    render_composite_montage(
+                        overlay_tiff_path,
+                        key_prefix=f"ca_{gene}_{selected_guide}",
+                        container=composite_container,
+                    )
                     if STATIC_ASSET_URL_ROOT and STATIC_ASSET_PATH:
                         # Use nginx-served static files when configured
                         relative_path = overlay_tiff_path.replace(STATIC_ASSET_PATH, "")
@@ -272,16 +376,26 @@ def display_gene_montages(gene_montages_root, gene):
                 st.warning(f"No image found for {gene} - {selected_guide}")
 
 
-def display_cluster(cluster_data, cell_class=None, channel_combo=None):
+def display_cluster(
+    cluster_data, cell_class=None, channel_combo=None, feature_data=None, feature_col=None
+):
     r"""
     :param cluster_data: a dataframe from load_cluster_data
     :param cell_class: the selected cell class filter value
     :param channel_combo: the selected channel combo filter value
-    :param container: an st.container or equivalent that UI elements will be added to
+    :param feature_data: optional DataFrame indexed by gene_symbol_0 with feature values
+    :param feature_col: optional feature column name; if set, colors points by feature value
     """
     global st
     # Display the data
     if not cluster_data.empty:
+        feature_mode = (
+            feature_col is not None
+            and feature_data is not None
+            and not feature_data.empty
+            and feature_col in feature_data.columns
+        )
+
         # Always treat grouping column as categorical for discrete color maps
         if st.session_state.groupby_column in cluster_data.columns:
             cluster_data[st.session_state.groupby_column] = cluster_data[
@@ -323,16 +437,238 @@ def display_cluster(cluster_data, cell_class=None, channel_combo=None):
         # Use plotly.graph_objects for full control
         fig = go.Figure()
 
-        # Plot each group as its own trace so all appear in the legend
-        # First phase: Add unselected points (all in gray)
-        if selected_item is not None:
-            for group in group_names:
-                if group != selected_item:
+        if feature_mode:
+            # --- Feature coloring mode: continuous viridis scale ---
+            cluster_data = cluster_data.copy()
+            cluster_data["_feat_val"] = cluster_data["gene_symbol_0"].map(
+                feature_data[feature_col]
+            )
+            # Recompute selected/other after copy
+            selected_data = cluster_data[
+                cluster_data[groupby_column].astype(str) == str(selected_item)
+            ]
+            other_data = cluster_data[
+                cluster_data[groupby_column].astype(str) != str(selected_item)
+            ]
+
+            # Compute color range from actual data (2nd–98th percentile for robustness)
+            _vals = cluster_data["_feat_val"].dropna()
+            if len(_vals) > 0:
+                _cmin = float(_vals.quantile(0.02))
+                _cmax = float(_vals.quantile(0.98))
+                if _cmin == _cmax:
+                    _cmin -= 0.5
+                    _cmax += 0.5
+            else:
+                _cmin, _cmax = -3.0, 3.0
+
+            if feature_col == SCRNASEQ_AGING_FEATURE:
+                # Signed age-coefficient: diverging scale, symmetric about zero
+                _colorscale = "RdBu_r"
+                _bound = max(abs(_cmin), abs(_cmax))
+                _cmin, _cmax = -_bound, _bound
+            else:
+                _colorscale = "viridis"
+
+            viridis_marker_base = dict(
+                colorscale=_colorscale,
+                cmin=_cmin,
+                cmax=_cmax,
+                colorbar=dict(title=feature_col, thickness=15),
+            )
+
+            selected_gene = st.session_state.get("selected_gene", None)
+
+            if selected_item is not None:
+                # Unselected points: faded, parula colored, colorbar shown here
+                if not other_data.empty:
+                    fig.add_trace(
+                        make_scatter_trace(
+                            x=other_data["PHATE_0"],
+                            y=other_data["PHATE_1"],
+                            marker=dict(
+                                **viridis_marker_base,
+                                color=other_data["_feat_val"].tolist(),
+                                size=8,
+                                opacity=0.3,
+                                showscale=True,
+                            ),
+                            text=other_data["gene_symbol_0"],
+                            customdata=other_data[HOVER_COLUMNS],
+                            name="unselected",
+                            showlegend=False,
+                        )
+                    )
+
+                if not selected_data.empty:
+                    selected_gene_df = (
+                        selected_data[selected_data["gene_symbol_0"] == selected_gene]
+                        if selected_gene
+                        else pd.DataFrame()
+                    )
+                    other_genes_df = (
+                        selected_data[selected_data["gene_symbol_0"] != selected_gene]
+                        if selected_gene
+                        else selected_data
+                    )
+
+                    if not other_genes_df.empty:
+                        fig.add_trace(
+                            make_scatter_trace(
+                                x=other_genes_df["PHATE_0"],
+                                y=other_genes_df["PHATE_1"],
+                                marker=dict(
+                                    **viridis_marker_base,
+                                    color=other_genes_df["_feat_val"].tolist(),
+                                    size=10,
+                                    opacity=1.0,
+                                    showscale=False,
+                                    line=dict(width=2, color="black"),
+                                ),
+                                text=other_genes_df["gene_symbol_0"],
+                                customdata=other_genes_df[HOVER_COLUMNS],
+                                name="selected_cluster",
+                                showlegend=False,
+                            )
+                        )
+
+                    if not selected_gene_df.empty:
+                        fig.add_trace(
+                            make_scatter_trace(
+                                x=selected_gene_df["PHATE_0"],
+                                y=selected_gene_df["PHATE_1"],
+                                marker=dict(
+                                    **viridis_marker_base,
+                                    color=selected_gene_df["_feat_val"].tolist(),
+                                    size=15,
+                                    opacity=1.0,
+                                    showscale=False,
+                                    symbol="circle",
+                                    line=dict(width=3, color="white"),
+                                ),
+                                text=selected_gene_df["gene_symbol_0"],
+                                customdata=selected_gene_df[HOVER_COLUMNS],
+                                name=f"{selected_gene} (Selected)",
+                                showlegend=False,
+                            )
+                        )
+            else:
+                # No selection: single trace, all points colored by feature
+                fig.add_trace(
+                    make_scatter_trace(
+                        x=cluster_data["PHATE_0"],
+                        y=cluster_data["PHATE_1"],
+                        marker=dict(
+                            **viridis_marker_base,
+                            color=cluster_data["_feat_val"].tolist(),
+                            size=8,
+                            opacity=1.0,
+                            showscale=True,
+                        ),
+                        text=cluster_data["gene_symbol_0"],
+                        customdata=cluster_data[HOVER_COLUMNS],
+                        name="all",
+                        showlegend=False,
+                    )
+                )
+
+        else:
+            # --- Cluster coloring mode (existing behavior) ---
+            # Plot each group as its own trace so all appear in the legend
+            # First phase: Add unselected points (all in gray)
+            if selected_item is not None:
+                for group in group_names:
+                    if group != selected_item:
+                        group_df = cluster_data[cluster_data[groupby_column] == group]
+                        marker = dict(
+                            color="gray",  # All unselected points are gray
+                            size=8,
+                            opacity=0.3,
+                        )
+                        fig.add_trace(
+                            make_scatter_trace(
+                                x=group_df["PHATE_0"],
+                                y=group_df["PHATE_1"],
+                                marker=marker,
+                                text=group_df["gene_symbol_0"],
+                                customdata=group_df[HOVER_COLUMNS],
+                                name=str(group),
+                                showlegend=False,
+                            )
+                        )
+
+                # Second phase: Add selected points on top
+                for group in group_names:
+                    if group == selected_item:
+                        group_df = cluster_data[cluster_data[groupby_column] == group]
+
+                        # Get the selected gene if any
+                        selected_gene = st.session_state.get("selected_gene", None)
+
+                        # Split the dataframe into selected gene and other genes
+                        selected_gene_df = (
+                            group_df[group_df["gene_symbol_0"] == selected_gene]
+                            if selected_gene
+                            else pd.DataFrame()
+                        )
+                        other_genes_df = (
+                            group_df[group_df["gene_symbol_0"] != selected_gene]
+                            if selected_gene
+                            else group_df
+                        )
+
+                        # Add other genes in the selected group
+                        if not other_genes_df.empty:
+                            marker = dict(
+                                color=color_map[group],
+                                size=10,
+                                opacity=1.0,
+                                line=dict(width=2, color="black"),
+                            )
+                            fig.add_trace(
+                                make_scatter_trace(
+                                    x=other_genes_df["PHATE_0"],
+                                    y=other_genes_df["PHATE_1"],
+                                    marker=marker,
+                                    text=other_genes_df["gene_symbol_0"],
+                                    customdata=other_genes_df[HOVER_COLUMNS],
+                                    name=str(group),
+                                    showlegend=False,
+                                )
+                            )
+
+                        # Add the selected gene with special highlighting
+                        if not selected_gene_df.empty:
+                            marker = dict(
+                                color=color_map[
+                                    group
+                                ],  # Use the cluster's color instead of red
+                                size=15,  # Larger size
+                                opacity=1.0,
+                                symbol="circle",  # Filled circle
+                                line=dict(
+                                    width=3, color="white"
+                                ),  # White border for contrast
+                            )
+                            fig.add_trace(
+                                make_scatter_trace(
+                                    x=selected_gene_df["PHATE_0"],
+                                    y=selected_gene_df["PHATE_1"],
+                                    marker=marker,
+                                    text=selected_gene_df["gene_symbol_0"],
+                                    customdata=selected_gene_df[HOVER_COLUMNS],
+                                    name=f"{selected_gene} (Selected)",
+                                    showlegend=False,
+                                )
+                            )
+            else:
+                # No selection: add all points with their original colors
+                for group in group_names:
                     group_df = cluster_data[cluster_data[groupby_column] == group]
                     marker = dict(
-                        color="gray",  # All unselected points are gray
+                        color=color_map[group],
                         size=8,
-                        opacity=0.3,
+                        opacity=1.0,
                     )
                     fig.add_trace(
                         make_scatter_trace(
@@ -345,91 +681,6 @@ def display_cluster(cluster_data, cell_class=None, channel_combo=None):
                             showlegend=False,
                         )
                     )
-
-            # Second phase: Add selected points on top
-            for group in group_names:
-                if group == selected_item:
-                    group_df = cluster_data[cluster_data[groupby_column] == group]
-
-                    # Get the selected gene if any
-                    selected_gene = st.session_state.get("selected_gene", None)
-
-                    # Split the dataframe into selected gene and other genes
-                    selected_gene_df = (
-                        group_df[group_df["gene_symbol_0"] == selected_gene]
-                        if selected_gene
-                        else pd.DataFrame()
-                    )
-                    other_genes_df = (
-                        group_df[group_df["gene_symbol_0"] != selected_gene]
-                        if selected_gene
-                        else group_df
-                    )
-
-                    # Add other genes in the selected group
-                    if not other_genes_df.empty:
-                        marker = dict(
-                            color=color_map[group],
-                            size=10,
-                            opacity=1.0,
-                            line=dict(width=2, color="black"),
-                        )
-                        fig.add_trace(
-                            make_scatter_trace(
-                                x=other_genes_df["PHATE_0"],
-                                y=other_genes_df["PHATE_1"],
-                                marker=marker,
-                                text=other_genes_df["gene_symbol_0"],
-                                customdata=other_genes_df[HOVER_COLUMNS],
-                                name=str(group),
-                                showlegend=False,
-                            )
-                        )
-
-                    # Add the selected gene with special highlighting
-                    if not selected_gene_df.empty:
-                        marker = dict(
-                            color=color_map[
-                                group
-                            ],  # Use the cluster's color instead of red
-                            size=15,  # Larger size
-                            opacity=1.0,
-                            symbol="circle",  # Filled circle
-                            line=dict(
-                                width=3, color="white"
-                            ),  # White border for contrast
-                        )
-                        fig.add_trace(
-                            make_scatter_trace(
-                                x=selected_gene_df["PHATE_0"],
-                                y=selected_gene_df["PHATE_1"],
-                                marker=marker,
-                                text=selected_gene_df["gene_symbol_0"],
-                                customdata=selected_gene_df[HOVER_COLUMNS],
-                                name=f"{selected_gene} (Selected)",
-                                showlegend=False,
-                            )
-                        )
-        else:
-            # No selection: add all points with their original colors
-            for group in group_names:
-                group_df = cluster_data[cluster_data[groupby_column] == group]
-                marker = dict(
-                    color=color_map[group],
-                    size=8,
-                    opacity=1.0,
-                )
-                fig.add_trace(
-                    make_scatter_trace(
-                        x=group_df["PHATE_0"],
-                        y=group_df["PHATE_1"],
-                        marker=marker,
-                        text=group_df["gene_symbol_0"],
-                        customdata=group_df[HOVER_COLUMNS],
-                        name=str(group),
-                        showlegend=False,
-                    )
-                )
 
         # Update layout
         fig.update_layout(
@@ -451,8 +702,16 @@ def display_cluster(cluster_data, cell_class=None, channel_combo=None):
             )
 
         # Display the plot with click event handling
+        st.checkbox(
+            "Vectorize points for SVG export (slower render; makes points selectable in Illustrator)",
+            key="cluster_vector_export",
+        )
         event = st.plotly_chart(
-            fig, use_container_width=True, key="cluster_plot", on_select="rerun"
+            fig,
+            use_container_width=True,
+            key="cluster_plot",
+            on_select="rerun",
+            config={"toImageButtonOptions": {"format": "svg"}},
         )
 
         # Handle click events
@@ -796,6 +1055,160 @@ def display_uniprot_info():
                     st.write("Uniprot Function: Not available")
 
 
+@st.cache_data
+def load_bootstrap_results(cell_class, channel_combo):
+    path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "bootstrap",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__all_gene_bootstrap_results.tsv",
+    )
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path, sep="\t")
+
+
+@st.cache_data
+def load_construct_table(cell_class, channel_combo):
+    path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "tsvs",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__features_constructs.tsv",
+    )
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path, sep="\t")
+
+
+@st.cache_data
+def load_gene_table(cell_class, channel_combo):
+    path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "tsvs",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__features_genes.tsv",
+    )
+    if not os.path.exists(path):
+        return None
+    return pd.read_csv(path, sep="\t")
+
+
+@st.cache_data
+def load_cached_control_feature_values(
+    cell_class, channel_combo, feature, perturbation_name_col, control_key
+):
+    parquet_path = os.path.join(
+        BRIEFLOW_OUTPUT_PATH,
+        "aggregate",
+        "parquets",
+        f"CeCl-{cell_class}_ChCo-{channel_combo}__features_singlecell.parquet",
+    )
+    if not os.path.exists(parquet_path):
+        return None
+    return load_control_feature_values(
+        parquet_path, feature, perturbation_name_col, control_key
+    )
+
+
+def display_sgrna_representativeness(gene, cell_class, channel_combo):
+    """Show which of a gene's sgRNAs best represent its phenotype vs. control.
+
+    For each bootstrap-significant feature (FDR < 0.05 vs. the control),
+    plots the control single-cell distribution with every targeting sgRNA's
+    median value overlaid (plus the gene-level median), and shows a table
+    ranking sgRNAs by distance to the gene-level median -- the sgRNA(s)
+    closest to the gene median are the most representative validation
+    candidates, as opposed to outlier sgRNAs furthest from control.
+    """
+    st.markdown("#### sgRNA Representativeness vs. Control")
+
+    aggregate_cfg = load_config().get("aggregate", {})
+    perturbation_name_col = aggregate_cfg.get("perturbation_name_col", "gene_symbol_0")
+    perturbation_id_col = aggregate_cfg.get("perturbation_id_col", "cell_barcode_0")
+    control_key = aggregate_cfg.get("control_key", "0Safe")
+
+    bootstrap_df = load_bootstrap_results(cell_class, channel_combo)
+    construct_df = load_construct_table(cell_class, channel_combo)
+    gene_df = load_gene_table(cell_class, channel_combo)
+
+    if bootstrap_df is None:
+        st.info(
+            "No gene bootstrap results found for this cell class/channel combo."
+        )
+        return
+    if construct_df is None or gene_df is None:
+        st.info(
+            "Gene/construct feature tables not found for this cell class/channel combo."
+        )
+        return
+
+    sig_features = get_significant_features_for_gene(bootstrap_df, gene, gene_col="gene")
+
+    if sig_features:
+        ranking_df = rank_constructs_for_gene(
+            gene,
+            construct_df,
+            gene_df,
+            sig_features,
+            perturbation_name_col,
+            perturbation_id_col,
+            min_cell_count=50,
+        )
+        st.write(
+            f"{len(sig_features)} significant feature(s) for {gene}; sgRNAs ranked by distance "
+            "to gene median (most representative first):"
+        )
+        st.dataframe(ranking_df)
+    else:
+        st.write(f"No bootstrap-significant features found for {gene} (FDR < 0.05).")
+
+    # Offer all features significant in any gene from the DAPI_YFP_RFP_Cy5 matrix
+    all_sig_features = load_significant_features(cell_class, channel_combo)
+    feature_options = all_sig_features if all_sig_features else [f for f, _ in sig_features]
+    if not feature_options:
+        return
+
+    # Default to the first gene-specific significant feature if available
+    default_feature = sig_features[0][0] if sig_features else feature_options[0]
+    default_index = feature_options.index(default_feature) if default_feature in feature_options else 0
+
+    selected_feature = st.selectbox(
+        "Feature to plot vs. control",
+        options=feature_options,
+        index=default_index,
+        key=f"rep_feature_select_{gene}_{cell_class}_{channel_combo}",
+    )
+
+    control_values = load_cached_control_feature_values(
+        cell_class, channel_combo, selected_feature, perturbation_name_col, control_key
+    )
+    if control_values is None:
+        st.warning("Single-cell parquet not found for this cell class/channel combo.")
+        return
+
+    fig, ax = plot_feature_vs_control(
+        selected_feature,
+        gene,
+        construct_df,
+        gene_df,
+        control_values,
+        perturbation_name_col,
+        perturbation_id_col,
+        control_key,
+    )
+    st.pyplot(fig)
+    _svg_buf = io.StringIO()
+    fig.savefig(_svg_buf, format="svg", bbox_inches="tight")
+    st.download_button(
+        label="Download plot as SVG (vector, editable in Illustrator)",
+        data=_svg_buf.getvalue(),
+        file_name=f"{gene}_{selected_feature}.svg",
+        mime="image/svg+xml",
+        key=f"svg_dl_{uuid.uuid4()}",
+    )
+
+
 # -- Search/Filter state management --
 
 
@@ -845,6 +1258,14 @@ def initialize_session_state() -> None:
     # Initialize filter counter for unique keys
     if "filter_counter" not in st.session_state:
         st.session_state.filter_counter = 0
+
+    # Initialize feature color-by (None = cluster coloring)
+    if "feature_color_by" not in st.session_state:
+        st.session_state.feature_color_by = None
+
+    # Initialize controls visibility toggle
+    if "hide_controls" not in st.session_state:
+        st.session_state.hide_controls = False
 
 
 def on_global_gene_select() -> None:
@@ -1061,6 +1482,13 @@ all_clusters = sorted(
 
 st.sidebar.title("Filters")
 cluster_data = apply_all_filters(cluster_data)
+
+_control_key = load_config().get("aggregate", {}).get("control_key", "0Safe")
+st.sidebar.toggle(f"Hide controls ({_control_key})", key="hide_controls")
+if st.session_state.hide_controls:
+    cluster_data = cluster_data[~cluster_data["gene_symbol_0"].str.startswith(_control_key)]
+    all_genes = [g for g in all_genes if not g.startswith(_control_key)]
+
 cluster_genes = get_cluster_genes(cluster_data, st.session_state.selected_item)
 
 # --- UI Layout ---
@@ -1119,12 +1547,42 @@ cell_class = st.session_state.cell_class
 channel_combo = st.session_state.channel_combo
 leiden_resolution = st.session_state.leiden_resolution
 
+# Load feature data for the current filter selection
+_feature_data = load_feature_data(cell_class, channel_combo)
+# Always use significant features from DAPI_YFP_RFP_Cy5 as the canonical feature list
+_sig_features = load_significant_features("all", "DAPI_YFP_RFP_Cy5")
+_feature_options = ["Cluster (default)"] + _sig_features
+# Offer the external scRNA-seq aging values alongside the CellProfiler features
+if SCRNASEQ_AGING_FEATURE in _feature_data.columns and has_scrnaseq_aging_data():
+    _feature_options.append(SCRNASEQ_AGING_FEATURE)
+# Offer the external bulk RNA-seq DEG values (ADCP timepoints, Effero, Super-Effero)
+_feature_options += [
+    f for f in available_external_deg_features() if f in _feature_data.columns
+]
+_current_feature = st.session_state.get("feature_color_by") or "Cluster (default)"
+if _current_feature not in _feature_options:
+    _current_feature = "Cluster (default)"
+    st.session_state.feature_color_by = None
+
+_selected_feature_label = st.selectbox(
+    "Color by feature (FDR < 0.05; scRNAseq_aging_data = macrophage mean age-coef)",
+    options=_feature_options,
+    index=_feature_options.index(_current_feature),
+    key="feature_color_by_select",
+)
+st.session_state.feature_color_by = (
+    None if _selected_feature_label == "Cluster (default)" else _selected_feature_label
+)
+_feature_col = st.session_state.feature_color_by
+
 if not st.session_state.selected_item:
     # No cluster selected: Just show the full width cluster plot
     display_cluster(
         cluster_data,
         cell_class=st.session_state.cell_class,
         channel_combo=st.session_state.channel_combo,
+        feature_data=_feature_data,
+        feature_col=_feature_col,
     )
     cluster_table(cluster_data)
     feature_table(cell_class, channel_combo)
@@ -1133,9 +1591,16 @@ if not st.session_state.selected_item:
 else:
     # Cluster selected: Two columns: plot | detail.
     col1, col2 = st.columns([1, 1])
+    # Reserve a full-width region below the columns for the colored composite
+    # montage so it spans the whole page instead of the narrow detail column.
+    composite_container = st.container()
     with col1:
         display_cluster(
-            cluster_data, cell_class=cell_class, channel_combo=channel_combo
+            cluster_data,
+            cell_class=cell_class,
+            channel_combo=channel_combo,
+            feature_data=_feature_data,
+            feature_col=_feature_col,
         )
         cluster_table(cluster_data)
         feature_table(cell_class, channel_combo)
@@ -1209,7 +1674,12 @@ else:
             # Display montages only for the selected gene
             if st.session_state.selected_gene:
                 display_gene_montages(
-                    gene_montages_root, st.session_state.selected_gene
+                    gene_montages_root,
+                    st.session_state.selected_gene,
+                    composite_container=composite_container,
+                )
+                display_sgrna_representativeness(
+                    st.session_state.selected_gene, cell_class, channel_combo
                 )
             else:
                 # If no gene is selected yet, select the first one

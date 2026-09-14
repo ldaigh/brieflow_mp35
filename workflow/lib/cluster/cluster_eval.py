@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from matplotlib import pyplot as plt
+from matplotlib.lines import Line2D
 import seaborn as sns
 
 from lib.shared.file_utils import parse_filename, get_filename
@@ -824,3 +825,321 @@ def plot_cluster_sizes(phate_leiden_clustering):
     plt.ylabel("Cluster Size")
 
     return fig
+
+
+def get_significant_features_for_gene(
+    gene_bootstrap_df,
+    gene,
+    gene_col="gene",
+    fdr_threshold=0.05,
+    top_n=None,
+):
+    """Find the features driving a gene's bootstrap-significant phenotype.
+
+    Args:
+        gene_bootstrap_df (pandas.DataFrame): Gene-level bootstrap results
+            (e.g. loaded from `*__all_gene_bootstrap_results.tsv`), with one
+            row per gene and `{feature}_fdr` columns.
+        gene (str): Gene to look up.
+        gene_col (str, optional): Column name identifying the gene in
+            `gene_bootstrap_df`. Defaults to "gene".
+        fdr_threshold (float, optional): FDR cutoff for significance.
+            Defaults to 0.05.
+        top_n (int, optional): If set, only keep the `top_n` most significant
+            features. Defaults to None (keep all significant features).
+
+    Returns:
+        list[tuple[str, float]]: `(feature, fdr)` pairs for features where
+            the gene is significant, sorted most-significant first. Empty
+            list if the gene isn't found or has no significant features.
+    """
+    gene_rows = gene_bootstrap_df[gene_bootstrap_df[gene_col] == gene]
+    if len(gene_rows) == 0:
+        return []
+    gene_row = gene_rows.iloc[0]
+
+    fdr_cols = [c for c in gene_bootstrap_df.columns if c.endswith("_fdr")]
+    sig_features = []
+    for fdr_col in fdr_cols:
+        fdr_value = gene_row[fdr_col]
+        if pd.notna(fdr_value) and fdr_value < fdr_threshold:
+            feature = fdr_col[: -len("_fdr")]
+            sig_features.append((feature, fdr_value))
+
+    sig_features.sort(key=lambda pair: pair[1])
+
+    if top_n is not None:
+        sig_features = sig_features[:top_n]
+
+    return sig_features
+
+
+def rank_constructs_for_gene(
+    gene,
+    construct_table,
+    gene_table,
+    significant_features,
+    perturbation_name_col,
+    perturbation_id_col,
+    min_cell_count=None,
+):
+    """Rank a gene's sgRNAs by how well they recapitulate the gene's effect.
+
+    Each sgRNA's median feature vector (already centered/scaled on controls)
+    is compared to the gene-level median vector across `significant_features`
+    only, so the ranking reflects the features that actually drive the
+    gene's phenotype rather than noise. The sgRNA(s) with the smallest
+    distance to the gene median are the most "typical" representatives of
+    the gene's effect; sgRNAs far from the gene median are likely outliers,
+    not necessarily better validation candidates.
+
+    Args:
+        gene (str): Gene to rank constructs for.
+        construct_table (pandas.DataFrame): sgRNA-level feature table (e.g.
+            `*__features_constructs.tsv`).
+        gene_table (pandas.DataFrame): Gene-level feature table (e.g.
+            `*__features_genes.tsv`).
+        significant_features (list[str] or list[tuple[str, float]]): Feature
+            names to use for the distance calculation (as returned by
+            `get_significant_features_for_gene`, with or without fdr values).
+        perturbation_name_col (str): Column name for gene identifiers.
+        perturbation_id_col (str): Column name for sgRNA/construct identifiers.
+        min_cell_count (int, optional): sgRNAs with fewer cells than this are
+            kept in the result but flagged via `low_confidence` rather than
+            dropped. Defaults to None (no flagging).
+
+    Returns:
+        pandas.DataFrame: One row per sgRNA targeting `gene`, sorted ascending
+            by `distance_to_gene_median` (most representative first), with
+            columns `[perturbation_id_col, "cell_count", "distance_to_gene_median",
+            "low_confidence"] + significant_features`.
+
+    Raises:
+        ValueError: If `gene` has no rows in `gene_table` or no constructs in
+            `construct_table`, or if `significant_features` is empty.
+    """
+    if not significant_features:
+        raise ValueError(f"No significant features provided for gene '{gene}'")
+
+    # Allow passing (feature, fdr) tuples directly from get_significant_features_for_gene
+    feature_names = [
+        f[0] if isinstance(f, tuple) else f for f in significant_features
+    ]
+
+    gene_rows = gene_table[gene_table[perturbation_name_col] == gene]
+    if len(gene_rows) == 0:
+        raise ValueError(f"Gene '{gene}' not found in gene_table")
+    gene_median = gene_rows.iloc[0][feature_names].astype(float)
+
+    construct_rows = construct_table[
+        construct_table[perturbation_name_col] == gene
+    ].copy()
+    if len(construct_rows) == 0:
+        raise ValueError(f"No constructs found for gene '{gene}' in construct_table")
+
+    construct_features = construct_rows[feature_names].astype(float)
+    construct_rows["distance_to_gene_median"] = (
+        construct_features.subtract(gene_median, axis=1).abs().mean(axis=1)
+    )
+
+    if min_cell_count is not None:
+        construct_rows["low_confidence"] = (
+            construct_rows["cell_count"] < min_cell_count
+        )
+    else:
+        construct_rows["low_confidence"] = False
+
+    construct_rows = construct_rows.sort_values("distance_to_gene_median")
+
+    ordered_cols = (
+        [perturbation_id_col, "cell_count", "distance_to_gene_median", "low_confidence"]
+        + feature_names
+    )
+    return construct_rows[ordered_cols].reset_index(drop=True)
+
+
+def load_control_feature_values(
+    singlecell_parquet_path,
+    feature,
+    perturbation_name_col,
+    control_key,
+):
+    """Load a single feature's control-cell values from the single-cell table.
+
+    Only reads `[perturbation_name_col, feature]` from the parquet file, so
+    this is cheap even though the full single-cell table can be very large.
+
+    Note: control cells are not labeled exactly `control_key` in
+    `perturbation_name_col` -- during alignment they are renamed to
+    `"{control_key}_{construct_id}"` to disambiguate by guide (see
+    `lib.aggregate.align.prepare_alignment_data`). This matches that
+    convention by filtering with `str.startswith(control_key)`, consistent
+    with `centerscale_on_controls` and other control-detection code.
+
+    Args:
+        singlecell_parquet_path (str or Path): Path to the single-cell
+            feature parquet (e.g. `*__features_singlecell.parquet`).
+        feature (str): Feature column to load.
+        perturbation_name_col (str): Column identifying the gene/perturbation.
+        control_key (str): Control prefix (e.g. "0Safe").
+
+    Returns:
+        pandas.Series: Control-cell values for `feature`.
+    """
+    df = pd.read_parquet(
+        singlecell_parquet_path, columns=[perturbation_name_col, feature]
+    )
+    control_mask = df[perturbation_name_col].astype(str).str.startswith(control_key)
+    return df.loc[control_mask, feature]
+
+
+def plot_feature_vs_control(
+    feature,
+    gene,
+    construct_table,
+    gene_table,
+    control_values,
+    perturbation_name_col,
+    perturbation_id_col,
+    control_key,
+    figsize=(10, 5),
+    ax=None,
+):
+    """Plot a feature's control distribution with each sgRNA's median overlaid.
+
+    Visualizes, for one feature, the `control_key` single-cell distribution
+    as a background histogram, then marks each of the gene's sgRNAs at its
+    median value (and the gene-level median), so sgRNAs that fall near the
+    bulk of the gene's other sgRNAs (and away from the control distribution)
+    can be identified as representative, while outliers stand out visually.
+
+    Args:
+        feature (str): Feature to plot.
+        gene (str): Gene whose sgRNAs should be overlaid.
+        construct_table (pandas.DataFrame): sgRNA-level feature table.
+        gene_table (pandas.DataFrame): Gene-level feature table.
+        control_values (pandas.Series): Control single-cell values for
+            `feature`, e.g. from `load_control_feature_values`.
+        perturbation_name_col (str): Column name for gene identifiers.
+        perturbation_id_col (str): Column name for sgRNA/construct identifiers.
+        control_key (str): Control label (used for the legend/title only).
+        figsize (tuple, optional): Figure size, used only if `ax` is None.
+            Defaults to (10, 5).
+        ax (matplotlib.axes.Axes, optional): Axes to draw on. A new figure is
+            created if None.
+
+    Returns:
+        tuple: (fig, ax) matplotlib figure and axes objects.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=figsize)
+    else:
+        fig = ax.get_figure()
+
+    sns.histplot(
+        control_values, stat="density", color="lightgray", label=control_key, ax=ax
+    )
+
+    construct_rows = construct_table[construct_table[perturbation_name_col] == gene]
+    colors = sns.color_palette("husl", n_colors=max(len(construct_rows), 1))
+    # Cycle dash patterns (in addition to color) and stagger marker heights so
+    # individual sgRNA lines stay distinguishable even when they overlap.
+    dash_patterns = [
+        (0, ()),  # solid
+        (0, (4, 2)),  # dash
+        (0, (1, 1)),  # dotted
+        (0, (5, 1, 1, 1)),  # dash-dot
+        (0, (3, 1, 1, 1, 1, 1)),  # dash-dot-dot
+        (0, (7, 3)),  # long dash
+        (0, (1, 3)),  # sparse dots
+    ]
+    markers = ["o", "s", "^", "D", "v", "P", "X"]
+    n_constructs = len(construct_rows)
+    sgrna_values = []
+    # Build legend handles manually so each entry shows color + dash + marker.
+    legend_handles = [
+        Line2D([0], [0], color="lightgray", linewidth=8, label=control_key)
+    ]
+    for i, (color, (_, row)) in enumerate(zip(colors, construct_rows.iterrows())):
+        cell_count = row.get("cell_count")
+        label = f"{row[perturbation_id_col]} (n={cell_count})"
+        value = row[feature]
+        sgrna_values.append(value)
+        dash = dash_patterns[i % len(dash_patterns)]
+        marker = markers[i % len(markers)]
+        ax.axvline(
+            value,
+            color=color,
+            linewidth=1.8,
+            linestyle=dash,
+            alpha=0.9,
+        )
+        # Stagger a marker along each line's height to break up overlaps.
+        y_frac = 0.95 - 0.6 * (i / max(n_constructs - 1, 1))
+        ax.plot(
+            value,
+            y_frac,
+            marker=marker,
+            color=color,
+            markersize=7,
+            markeredgecolor="black",
+            markeredgewidth=0.5,
+            transform=ax.get_xaxis_transform(),
+            clip_on=False,
+            zorder=5,
+        )
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color=color,
+                linewidth=1.8,
+                linestyle=dash,
+                marker=marker,
+                markersize=7,
+                markeredgecolor="black",
+                markeredgewidth=0.5,
+                label=label,
+            )
+        )
+
+    gene_rows = gene_table[gene_table[perturbation_name_col] == gene]
+    gene_value = None
+    if len(gene_rows) > 0:
+        gene_value = gene_rows.iloc[0][feature]
+        ax.axvline(
+            gene_value,
+            color="black",
+            linewidth=2.2,
+            linestyle="--",
+        )
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="black",
+                linewidth=2.2,
+                linestyle="--",
+                label=f"{gene} (gene median)",
+            )
+        )
+
+    # Clip the x-axis to the bulk of the control distribution (robust
+    # percentiles) so outliers don't compress the main distribution, while
+    # still keeping every sgRNA / gene median in view.
+    cv = pd.Series(control_values).dropna()
+    if len(cv) > 0:
+        lo, hi = np.percentile(cv, [1, 99])
+        marks = [v for v in sgrna_values + [gene_value] if v is not None and np.isfinite(v)]
+        if marks:
+            lo = min(lo, min(marks))
+            hi = max(hi, max(marks))
+        if hi > lo:
+            pad = 0.05 * (hi - lo)
+            ax.set_xlim(lo - pad, hi + pad)
+
+    ax.set_xlabel(feature)
+    ax.set_title(f"{gene}: {feature} vs. {control_key} control")
+    ax.legend(handles=legend_handles, fontsize=8, loc="best")
+
+    return fig, ax

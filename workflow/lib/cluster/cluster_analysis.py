@@ -1058,6 +1058,25 @@ def two_feature_plot(
     return ax
 
 
+def _cluster_label(cluster_id):
+    """Render a cluster id for the heatmap's group band.
+
+    `cluster_heatmap` documents `cluster_ids` as "int, str, or list", and
+    grouping columns (protein complexes, pathway names) are legitimate string
+    ids. Numeric ids are still shown without a trailing ".0".
+
+    Args:
+        cluster_id: The cluster identifier to label.
+
+    Returns:
+        str: Display label for the cluster.
+    """
+    try:
+        return f"{int(cluster_id)}"
+    except (TypeError, ValueError):
+        return str(cluster_id)
+
+
 def cluster_heatmap(
     feature_df,
     cluster_df,
@@ -1385,7 +1404,7 @@ def cluster_heatmap(
                 ax.text(
                     center_pos,
                     0.5,
-                    f"{int(cluster_id)}",
+                    _cluster_label(cluster_id),
                     ha="center",
                     va="center",
                     fontsize=label_size,
@@ -1412,7 +1431,7 @@ def cluster_heatmap(
                 ax.text(
                     0.5,
                     center_pos,
-                    f"{int(cluster_id)}",
+                    _cluster_label(cluster_id),
                     ha="center",
                     va="center",
                     fontsize=label_size - 4,
