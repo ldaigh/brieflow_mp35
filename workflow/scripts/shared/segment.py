@@ -34,6 +34,9 @@ if method == "cellpose":
                 cell_cellprob_threshold=params["cell_cellprob_threshold"],
             ),
             reconcile=params.get("reconcile"),
+            # LOCAL ADDITION: see rule_utils.get_segmentation_params.
+            # logscale=False stops the dim halo being amplified into signal.
+            logscale=params.get("logscale", True),
             return_counts=params.get("return_counts", True),
             gpu=params.get("gpu", False),
             cells=segment_cells,
@@ -56,6 +59,9 @@ if method == "cellpose":
                 cell_cellprob_threshold=params["cell_cellprob_threshold"],
             ),
             reconcile=params.get("reconcile"),
+            # LOCAL ADDITION: see rule_utils.get_segmentation_params.
+            # logscale=False stops the dim halo being amplified into signal.
+            logscale=params.get("logscale", True),
             return_counts=params.get("return_counts", True),
             gpu=params.get("gpu", False),
             cells=segment_cells,

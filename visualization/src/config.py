@@ -32,6 +32,11 @@ EFFERO_SUPEREFFERO_DEG_PATH = os.environ.get("EFFERO_SUPEREFFERO_DEG_PATH", None
 ADCP_COMBO_PATH = os.environ.get("ADCP_COMBO_PATH", None)
 BEADS_GENOME_WIDE_PATH = os.environ.get("BEADS_GENOME_WIDE_PATH", None)
 
+# External gDNA guide-count CSV (headerless '<guide name>,<count>'), used by the
+# gene-abundance comparison on the Quality Control page. Optional: when
+# unset/missing, that figure is replaced by a short note.
+GDNA_COUNTS_PATH = os.environ.get("GDNA_COUNTS_PATH", None)
+
 # Protein-complex level analysis outputs (gene_sets.tsv, complex_features,
 # complex_bootstrap_results, complex_coherence, ...). Produced by
 # scripts/complex_analysis/. Defaults to the pipeline's own output tree, so no

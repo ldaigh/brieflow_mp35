@@ -190,6 +190,14 @@ def get_segmentation_params(module: str, config: Dict[str, Any]) -> Dict[str, An
         "reconcile": module_config.get("reconcile", False),
         "return_counts": module_config.get("return_counts", True),
         "gpu": module_config.get("gpu", False),
+        # LOCAL ADDITION (not upstream v1.4.10). segment_cellpose() accepts logscale but
+        # upstream never exposes it, so the pipeline always log-scaled the cyto channel.
+        # That compresses dynamic range and amplifies the dim peri-cellular halo, which
+        # made cpsam masks run loose: a 6-tile sweep measured mean |grad| on the mask edge
+        # at 1.44x the tile mean with logscale=True vs 3.38x with logscale=False, and
+        # median cytoplasm intensity 3415 vs 5227. Default stays True so behaviour is
+        # unchanged unless a config sets it.
+        "logscale": module_config.get("logscale", True),
         "segment_cells": module_config.get("segment_cells", True),
     }
 

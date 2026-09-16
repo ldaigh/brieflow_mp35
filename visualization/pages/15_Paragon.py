@@ -652,6 +652,98 @@ low_pct, high_pct = sb.slider(
 )
 show_outline = sb.checkbox("Outline the subject cell", value=False, key="paragon_outline")
 
+sb.subheader("Scale bar")
+show_scale_bar = sb.checkbox(
+    "Draw a scale bar",
+    value=True,
+    key="paragon_scale_bar",
+    help=(
+        "A white bar in the bottom-right corner of every crop, no label. The "
+        "bar is drawn at an integer number of pixels, and the length that "
+        "rounding actually produced is printed below -- quote that, not the "
+        "requested value."
+    ),
+)
+um_per_px = sb.number_input(
+    "µm per pixel",
+    min_value=0.001,
+    max_value=100.0,
+    value=float(ppaths.PIXEL_SIZE_UM),
+    step=0.005,
+    format="%.4f",
+    key="paragon_um_per_px",
+    disabled=not show_scale_bar,
+    help=(
+        "Defaults to 0.325, which is `pixel_size_x` in every row of "
+        "`preprocess/metadata/phenotype/P-*__combined_metadata.parquet`. Crops "
+        "are taken at native resolution from the 2048x2048 aligned tiles, so "
+        "no resampling intervenes."
+    ),
+)
+scale_bar_um = sb.number_input(
+    "Bar length (µm)",
+    min_value=0.1,
+    max_value=500.0,
+    value=float(ppaths.SCALE_BAR_UM),
+    step=1.0,
+    key="paragon_scale_bar_um",
+    disabled=not show_scale_bar,
+)
+if show_scale_bar:
+    _geom = prender.scale_bar_geometry(box, box, scale_bar_um, um_per_px)
+    if _geom is None:
+        sb.warning(
+            f"A {scale_bar_um:g} µm bar is {scale_bar_um / um_per_px:.0f} px, "
+            f"which does not fit in a {box} px crop ({box * um_per_px:.1f} µm "
+            "across). No bar will be drawn - raise the crop size or shorten "
+            "the bar."
+        )
+    else:
+        sb.caption(
+            f"{_geom['length_px']} px bar = "
+            f"**{_geom['length_um_actual']:.2f} µm** | crop {box} px = "
+            f"{box * um_per_px:.1f} µm | bar spans "
+            f"{100 * _geom['length_px'] / box:.0f}% of the width"
+        )
+
+sb.subheader("Export")
+export_on = sb.checkbox(
+    "Per-image TIFF downloads",
+    value=True,
+    key="paragon_export",
+    help=(
+        "Adds a download button under every crop, plus one zip per panel. "
+        "Encoding is done on each rerun whether or not you click, but an 80 px "
+        "crop is only ~19 KB."
+    ),
+)
+EXPORT_KINDS = {
+    "Displayed composite (8-bit RGB)": "composite",
+    "Raw channel stack (16-bit)": "stack",
+}
+export_kind = EXPORT_KINDS[
+    sb.radio(
+        "TIFF contents",
+        list(EXPORT_KINDS),
+        key="paragon_export_kind",
+        disabled=not export_on,
+        help=(
+            "The composite is exactly what is on screen - contrast range, "
+            "channel colours and scale bar already applied - and is what a "
+            "figure panel needs. The raw stack is the untouched uint16 "
+            "channels for requantification; no scale bar is burnt into it, "
+            "because that would overwrite real pixel values. Both carry the "
+            "µm calibration in their ImageJ tags."
+        ),
+    )
+]
+export_scale_bar = sb.checkbox(
+    "Burn the scale bar into exported composites",
+    value=True,
+    key="paragon_export_scale_bar",
+    disabled=not (export_on and show_scale_bar and export_kind == "composite"),
+)
+
 sb.subheader("Quality gates")
 active_gates = [
     g
@@ -838,8 +930,47 @@ tab_ladder, tab_controls, tab_attr, tab_diag = st.tabs(
 )
 
 
-def render_panel(sel, container, caption_col="residual", title=None):
-    """Crop, composite and display one row of cells."""
+def cell_tag(row):
+    """Compact, unique-per-cell identifier used in keys and filenames."""
+    return f"W{row['well']}-T{int(row['tile'])}-c{int(row['cell_0'])}"
+
+
+def tiff_export(crop, rgb, row, panel):
+    """(filename, bytes) for one exported crop, honouring the export mode."""
+    provenance = (
+        f"{row[ppaths.PERTURBATION_NAME_COL]} {row[ppaths.PERTURBATION_ID_COL]} "
+        f"{cell_tag(row)} | {subject} | {panel} | plate {int(row['plate'])} | "
+        f"box {box} px | {um_per_px:g} µm/px"
+    )
+    if export_kind == "stack":
+        name = prender.safe_filename(
+            "paragon", subject, panel,
+            row[ppaths.PERTURBATION_NAME_COL], cell_tag(row), "raw",
+            suffix=".tiff",
+        )
+        return name, prender.stack_tiff_bytes(
+            crop,
+            um_per_px=um_per_px,
+            description=provenance,
+            channel_names=CHANNEL_LABELS,
+        )
+    name = prender.safe_filename(
+        "paragon", subject, panel,
+        row[ppaths.PERTURBATION_NAME_COL], cell_tag(row), "composite",
+        suffix=".tiff",
+    )
+    return name, prender.composite_tiff_bytes(
+        rgb, um_per_px=um_per_px, description=provenance
+    )
+
+
+def render_panel(sel, container, caption_col="residual", title=None, panel="panel"):
+    """Crop, composite and display one row of cells.
+
+    `panel` identifies this row within the page; it disambiguates the download
+    widgets' keys and names their files, so the same cell appearing in two
+    panels does not collide.
+    """
     if sel is None or len(sel) == 0:
         container.info("No cells to show.")
         return
@@ -866,10 +997,26 @@ def render_panel(sel, container, caption_col="residual", title=None):
     if title:
         container.markdown(title)
     cols = container.columns(len(crop_list))
+    exports = []
     for i, (crop, rng) in enumerate(zip(crop_list, per_cell_ranges)):
         rgb = prender.composite_rgb(crop, rng, colors=colors, outline=show_outline)
         row = sel.iloc[i]
-        cols[i].image(rgb, use_container_width=True)
+
+        # Geometry from this image rather than from `box`: crop_cell always
+        # returns box x box, but deriving it here keeps the bar honest if that
+        # ever stops being true.
+        geom = (
+            prender.scale_bar_geometry(
+                rgb.shape[0], rgb.shape[1], scale_bar_um, um_per_px
+            )
+            if show_scale_bar
+            else None
+        )
+        # draw_scale_bar copies, so `rgb` stays available unbarred for an
+        # export that should not have the bar burnt in.
+        shown = prender.draw_scale_bar(rgb, geom) if geom is not None else rgb
+
+        cols[i].image(shown, use_container_width=True)
         label = f"**{row[ppaths.PERTURBATION_NAME_COL]}**"
         cols[i].caption(
             f"{label}  \n`{row[ppaths.PERTURBATION_ID_COL]}`  \n"
@@ -877,6 +1024,31 @@ def render_panel(sel, container, caption_col="residual", title=None):
         )
         if caption_col in row.index:
             cols[i].caption(f"{caption_col} {row[caption_col]:.2f}")
+
+        if export_on:
+            fname, payload = tiff_export(
+                crop, shown if export_scale_bar else rgb, row, panel
+            )
+            exports.append((fname, payload))
+            cols[i].download_button(
+                "⬇ TIFF",
+                data=payload,
+                file_name=fname,
+                mime="image/tiff",
+                key=f"paragon_dl_{panel}_{i}_{cell_tag(row)}",
+                use_container_width=True,
+            )
+
+    if export_on and len(exports) > 1:
+        container.download_button(
+            f"⬇ All {len(exports)} as .zip",
+            data=prender.zip_bytes(exports),
+            file_name=prender.safe_filename(
+                "paragon", subject, panel, export_kind, suffix=".zip"
+            ),
+            mime="application/zip",
+            key=f"paragon_zip_{panel}",
+        )
 
 
 # =====================
@@ -952,7 +1124,10 @@ with tab_ladder:
                     )
                     continue
                 st.caption(format_stats_line(r.to_dict()))
-                render_panel(rung, st.container(), caption_col="residual")
+                render_panel(
+                    rung, st.container(), caption_col="residual",
+                    panel=f"ladder-p{pct}",
+                )
 
         with st.expander("Ladder statistics", expanded=False):
             st.dataframe(lstats, use_container_width=True)
@@ -1061,7 +1236,9 @@ with tab_ladder:
             f"match -> {estats['n_shown']} most typical elsewhere, from "
             f"{estats['n_tiles_shown']} tiles / {estats['n_guides_shown']} sgRNAs"
         )
-        render_panel(sel, st.container(), caption_col="nuisance_norm")
+        render_panel(
+            sel, st.container(), caption_col="nuisance_norm", panel="features"
+        )
 
         st.markdown("##### Why these cells")
         for _, row in sel.iterrows():
@@ -1115,7 +1292,10 @@ with tab_controls:
             st.warning("no control cells in this band")
             continue
         st.caption(format_stats_line(r.to_dict()))
-        render_panel(rung, st.container(), caption_col="residual")
+        render_panel(
+            rung, st.container(), caption_col="residual",
+            panel=f"control-p{pct}",
+        )
 
     st.divider()
     st.markdown("#### Shuffled axis")
@@ -1154,7 +1334,10 @@ with tab_controls:
         if r["n_shown"] == 0:
             st.warning("no cells in this band")
             continue
-        render_panel(rung, st.container(), caption_col="residual")
+        render_panel(
+            rung, st.container(), caption_col="residual",
+            panel=f"shuffled-p{pct}",
+        )
 
 
 # =====================
